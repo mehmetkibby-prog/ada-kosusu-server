@@ -1,8 +1,6 @@
 import asyncio
 import json
-import os
 import random
-import string
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,7 +10,7 @@ from urllib.parse import unquote
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Ada Kosusu Online Server", version="1.0.0")
+app = FastAPI(title="Ada Kosusu Online Server", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,10 +22,11 @@ app.add_middleware(
 MAX_HITS = 3
 ROOM_TTL_SECONDS = 60 * 60 * 2
 RECONNECT_GRACE_SECONDS = 15
-STATE_BROADCAST_INTERVAL = 0.20
-BASE_TRAVEL_MS = 2800
-MIN_OBSTACLE_INTERVAL_MS = 620
-MAX_OBSTACLE_INTERVAL_MS = 980
+STATE_BROADCAST_INTERVAL = 0.18
+JUMP_DURATION_MS = 900
+SLIDE_DURATION_MS = 820
+ACTION_COOLDOWN_MS = 390
+INPUT_TIME_CLAMP_MS = 220
 
 
 def now_ms() -> int:
@@ -50,8 +49,10 @@ def room_code(length: int = 5) -> str:
 @dataclass
 class Obstacle:
     id: int
+    wave_id: int
     lane: int
     kind: str
+    avoid: str
     spawn_at_ms: int
     impact_at_ms: int
     resolved_players: Set[str] = field(default_factory=set)
@@ -59,8 +60,10 @@ class Obstacle:
     def payload(self) -> dict:
         return {
             "id": self.id,
+            "waveId": self.wave_id,
             "lane": self.lane,
             "kind": self.kind,
+            "avoid": self.avoid,
             "spawnAt": self.spawn_at_ms,
             "impactAt": self.impact_at_ms,
         }
@@ -79,10 +82,22 @@ class Player:
     ws: Optional[WebSocket] = None
     disconnected_at: Optional[float] = None
     last_lane_change_at: float = 0.0
+    last_action_at_ms: int = 0
+    jump_started_ms: int = 0
+    jump_until_ms: int = 0
+    slide_started_ms: int = 0
+    slide_until_ms: int = 0
     joined_at: float = field(default_factory=time.time)
 
+    def pose_at(self, at_ms: int) -> str:
+        if self.jump_started_ms <= at_ms <= self.jump_until_ms:
+            return "jump"
+        if self.slide_started_ms <= at_ms <= self.slide_until_ms:
+            return "slide"
+        return "run"
+
     def public(self, room: "Room") -> dict:
-        distance = room.distance_m()
+        server_now = now_ms()
         return {
             "id": self.id,
             "name": self.name,
@@ -93,7 +108,8 @@ class Player:
             "connected": self.connected,
             "ready": self.ready,
             "isHost": self.slot == 1,
-            "distance": distance,
+            "distance": room.distance_m(),
+            "pose": self.pose_at(server_now),
         }
 
 
@@ -101,7 +117,7 @@ class Player:
 class Room:
     code: str
     players: Dict[str, Player] = field(default_factory=dict)
-    status: str = "waiting"  # waiting/countdown/running/finished
+    status: str = "waiting"
     winner_id: Optional[str] = None
     finish_reason: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -109,19 +125,38 @@ class Room:
     start_at_ms: Optional[int] = None
     seed: int = field(default_factory=lambda: random.randint(1, 2_000_000_000))
     obstacle_index: int = 0
+    wave_index: int = 0
     next_spawn_at_ms: Optional[int] = None
     obstacles: List[Obstacle] = field(default_factory=list)
+    last_wave_style: str = ""
     loop_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def active_players(self) -> List[Player]:
         return [p for p in self.players.values() if p.connected and p.ws is not None]
 
-    def distance_m(self) -> int:
+    def elapsed_s(self) -> float:
         if not self.start_at_ms:
-            return 0
-        elapsed = max(0, now_ms() - self.start_at_ms) / 1000.0
-        return int(elapsed * 9.5)
+            return 0.0
+        return max(0.0, (now_ms() - self.start_at_ms) / 1000.0)
+
+    def distance_m(self) -> int:
+        e = self.elapsed_s()
+        return int(e * 10.0 + min(180.0, e * e * 0.025))
+
+    def difficulty_stage(self) -> int:
+        e = self.elapsed_s()
+        if e < 18:
+            return 1
+        if e < 38:
+            return 2
+        if e < 62:
+            return 3
+        return 4
+
+    def speed_multiplier(self) -> float:
+        e = self.elapsed_s()
+        return min(1.85, 1.0 + e * 0.0105)
 
     def payload(self) -> dict:
         return {
@@ -134,6 +169,8 @@ class Room:
             "winnerId": self.winner_id,
             "finishReason": self.finish_reason,
             "maxHits": MAX_HITS,
+            "difficulty": self.difficulty_stage(),
+            "speedMultiplier": self.speed_multiplier(),
         }
 
 
@@ -144,7 +181,8 @@ rooms_lock = asyncio.Lock()
 @app.get("/")
 async def root():
     return {
-        "name": "Ada Kosusu Online Server",
+        "name": "Ada Kosusu Online Server V3",
+        "version": "3.0.0",
         "ok": True,
         "websocket": "/ws?mode=quick|create|join&name=...&room=...&token=...",
     }
@@ -154,6 +192,7 @@ async def root():
 async def health():
     return {
         "ok": True,
+        "version": "3.0.0",
         "rooms": len(rooms),
         "players": sum(len(r.players) for r in rooms.values()),
         "time": now_ms(),
@@ -182,31 +221,86 @@ async def broadcast_state(room: Room):
     await broadcast(room, room.payload())
 
 
-def difficulty_for(room: Room) -> tuple[int, int]:
-    """Returns obstacle interval and travel time. Difficulty grows gradually."""
-    if not room.start_at_ms:
-        return MAX_OBSTACLE_INTERVAL_MS, BASE_TRAVEL_MS
-    elapsed = max(0, now_ms() - room.start_at_ms) / 1000.0
-    interval = int(MAX_OBSTACLE_INTERVAL_MS - min(360, elapsed * 4.0))
-    interval = max(MIN_OBSTACLE_INTERVAL_MS, interval)
-    travel = int(BASE_TRAVEL_MS - min(650, elapsed * 5.0))
-    travel = max(2050, travel)
-    return interval, travel
+def difficulty_for(room: Room) -> tuple[int, int, int]:
+    """wave interval ms, obstacle travel ms, stage"""
+    stage = room.difficulty_stage()
+    e = room.elapsed_s()
+    if stage == 1:
+        interval = int(max(900, 1120 - e * 7))
+        travel = int(max(2450, 2820 - e * 15))
+    elif stage == 2:
+        interval = int(max(720, 880 - (e - 18) * 7))
+        travel = int(max(2050, 2400 - (e - 18) * 14))
+    elif stage == 3:
+        interval = int(max(580, 700 - (e - 38) * 5))
+        travel = int(max(1720, 2020 - (e - 38) * 12))
+    else:
+        interval = int(max(490, 570 - (e - 62) * 1.2))
+        travel = int(max(1480, 1700 - (e - 62) * 4.0))
+    return interval, travel, stage
 
 
-def choose_lane(room: Room) -> int:
-    rng = random.Random(room.seed + room.obstacle_index * 7919)
-    lane = rng.randint(0, 2)
-    # Avoid excessively repetitive sequences.
-    if len(room.obstacles) >= 2 and room.obstacles[-1].lane == room.obstacles[-2].lane == lane:
-        lane = (lane + 1 + rng.randint(0, 1)) % 3
-    return lane
+def rng_for(room: Room, salt: int) -> random.Random:
+    return random.Random(room.seed ^ (room.wave_index * 104729) ^ salt)
 
 
-def choose_kind(room: Room) -> str:
-    kinds = ["crate", "rock", "barrel", "fallen_palm"]
-    rng = random.Random(room.seed ^ (room.obstacle_index * 104729))
-    return kinds[rng.randrange(len(kinds))]
+def kind_for_avoid(avoid: str, rng: random.Random) -> str:
+    if avoid == "jump":
+        return rng.choice(["crate", "fallen_palm", "stone_hurdle"])
+    if avoid == "slide":
+        return rng.choice(["low_gate", "hanging_vines"])
+    return rng.choice(["barrel", "totem", "boulder"])
+
+
+def build_wave(room: Room, spawn_at: int, travel_ms: int, stage: int) -> tuple[List[Obstacle], int]:
+    rng = rng_for(room, 991)
+    roll = rng.random()
+    entries: List[tuple[int, str, str]] = []
+    style = "single"
+
+    # V3 difficulty: readable at first, then two-lane traps and compulsory jump/slide gates.
+    if stage == 1 or roll < (0.46 if stage == 2 else 0.28 if stage == 3 else 0.18):
+        lane = rng.randrange(3)
+        avoid = rng.choices(["jump", "slide", "dodge"], weights=[44, 23, 33])[0]
+        entries.append((lane, kind_for_avoid(avoid, rng), avoid))
+    elif roll < (0.90 if stage == 2 else 0.78 if stage == 3 else 0.68):
+        style = "double"
+        safe_lane = rng.randrange(3)
+        blocked = [lane for lane in range(3) if lane != safe_lane]
+        for lane in blocked:
+            avoid = rng.choices(["jump", "slide", "dodge"], weights=[38, 26, 36])[0]
+            entries.append((lane, kind_for_avoid(avoid, rng), avoid))
+    else:
+        # Full-width skill gate. It cannot be solved by lane switching; player must jump/slide.
+        style = "gate"
+        avoid = rng.choice(["jump", "slide"])
+        kind = "stone_hurdle" if avoid == "jump" else "low_gate"
+        for lane in range(3):
+            entries.append((lane, kind, avoid))
+
+    # Don't fire two compulsory gates almost back-to-back.
+    extra_gap = 0
+    if style == "gate":
+        extra_gap = 300 if stage <= 2 else 210
+        if room.last_wave_style == "gate":
+            extra_gap += 260
+    room.last_wave_style = style
+
+    obstacles: List[Obstacle] = []
+    wave_id = room.wave_index
+    for lane, kind, avoid in entries:
+        obstacles.append(Obstacle(
+            id=room.obstacle_index,
+            wave_id=wave_id,
+            lane=lane,
+            kind=kind,
+            avoid=avoid,
+            spawn_at_ms=spawn_at,
+            impact_at_ms=spawn_at + travel_ms,
+        ))
+        room.obstacle_index += 1
+    room.wave_index += 1
+    return obstacles, extra_gap
 
 
 async def start_match(room: Room):
@@ -221,12 +315,17 @@ async def start_match(room: Room):
         room.start_at_ms = now_ms() + 3200
         room.seed = random.randint(1, 2_000_000_000)
         room.obstacle_index = 0
-        room.next_spawn_at_ms = room.start_at_ms + 900
+        room.wave_index = 0
+        room.last_wave_style = ""
+        room.next_spawn_at_ms = room.start_at_ms + 850
         room.obstacles.clear()
         for p in room.players.values():
             p.lane = 1
             p.hits = 0
             p.ready = False
+            p.jump_started_ms = p.jump_until_ms = 0
+            p.slide_started_ms = p.slide_until_ms = 0
+            p.last_action_at_ms = 0
         await broadcast(room, {
             "type": "match_start",
             "serverNow": now_ms(),
@@ -255,8 +354,18 @@ async def finish_match(room: Room, winner_id: Optional[str], reason: str):
     await broadcast_state(room)
 
 
+def obstacle_hits_player(obstacle: Obstacle, player: Player) -> bool:
+    if player.lane != obstacle.lane:
+        return False
+    pose = player.pose_at(obstacle.impact_at_ms)
+    if obstacle.avoid == "jump" and pose == "jump":
+        return False
+    if obstacle.avoid == "slide" and pose == "slide":
+        return False
+    return True
+
+
 async def process_impacts(room: Room, current_ms: int):
-    # Resolve all obstacle impacts that have reached the player line.
     for obstacle in list(room.obstacles):
         if obstacle.impact_at_ms > current_ms:
             continue
@@ -266,7 +375,7 @@ async def process_impacts(room: Room, current_ms: int):
             obstacle.resolved_players.add(player.id)
             if room.status != "running":
                 continue
-            if player.lane == obstacle.lane:
+            if obstacle_hits_player(obstacle, player):
                 player.hits += 1
                 await broadcast(room, {
                     "type": "hit",
@@ -274,6 +383,7 @@ async def process_impacts(room: Room, current_ms: int):
                     "hits": player.hits,
                     "maxHits": MAX_HITS,
                     "obstacleId": obstacle.id,
+                    "avoid": obstacle.avoid,
                     "serverNow": current_ms,
                 })
                 if player.hits >= MAX_HITS:
@@ -282,7 +392,6 @@ async def process_impacts(room: Room, current_ms: int):
                     await finish_match(room, winner_id, "three_hits")
                     return
 
-        # Keep a little history then release memory.
         if current_ms - obstacle.impact_at_ms > 2500:
             try:
                 room.obstacles.remove(obstacle)
@@ -293,11 +402,11 @@ async def process_impacts(room: Room, current_ms: int):
 async def process_disconnects(room: Room):
     if room.status != "running":
         return
-    now = time.time()
+    stamp = time.time()
     for player in room.players.values():
         if player.connected or player.disconnected_at is None:
             continue
-        if now - player.disconnected_at >= RECONNECT_GRACE_SECONDS:
+        if stamp - player.disconnected_at >= RECONNECT_GRACE_SECONDS:
             opponents = [p for p in room.players.values() if p.id != player.id and p.connected]
             winner_id = opponents[0].id if opponents else None
             await finish_match(room, winner_id, "opponent_disconnected")
@@ -319,28 +428,19 @@ async def game_loop(code: str):
 
             if room.status == "running":
                 await process_disconnects(room)
-                if room.status != "running":
-                    pass
-                else:
-                    interval_ms, travel_ms = difficulty_for(room)
+                if room.status == "running":
+                    interval_ms, travel_ms, stage = difficulty_for(room)
                     while room.next_spawn_at_ms and current_ms >= room.next_spawn_at_ms:
-                        lane = choose_lane(room)
-                        kind = choose_kind(room)
-                        obstacle = Obstacle(
-                            id=room.obstacle_index,
-                            lane=lane,
-                            kind=kind,
-                            spawn_at_ms=room.next_spawn_at_ms,
-                            impact_at_ms=room.next_spawn_at_ms + travel_ms,
-                        )
-                        room.obstacles.append(obstacle)
-                        room.obstacle_index += 1
-                        room.next_spawn_at_ms += interval_ms
-                        await broadcast(room, {
-                            "type": "obstacle",
-                            "serverNow": current_ms,
-                            **obstacle.payload(),
-                        })
+                        spawn_at = room.next_spawn_at_ms
+                        wave, extra_gap = build_wave(room, spawn_at, travel_ms, stage)
+                        room.obstacles.extend(wave)
+                        room.next_spawn_at_ms += interval_ms + extra_gap
+                        for obstacle in wave:
+                            await broadcast(room, {
+                                "type": "obstacle",
+                                "serverNow": current_ms,
+                                **obstacle.payload(),
+                            })
                     await process_impacts(room, current_ms)
 
             monotonic = time.monotonic()
@@ -351,7 +451,7 @@ async def game_loop(code: str):
             if room.status == "finished":
                 return
 
-        await asyncio.sleep(0.045)
+        await asyncio.sleep(0.035)
 
 
 async def find_or_create_room(mode: str, requested: str) -> Room:
@@ -368,7 +468,6 @@ async def find_or_create_room(mode: str, requested: str) -> Room:
                 raise ValueError("Oda bulunamadı.")
             return rooms[code]
 
-        # quick match: oldest waiting room with one player, otherwise create.
         candidates = [
             r for r in rooms.values()
             if r.status == "waiting" and len(r.players) == 1 and len(r.active_players()) == 1
@@ -408,6 +507,14 @@ async def add_or_reconnect_player(room: Room, websocket: WebSocket, name: str, t
         return player
 
 
+def clamped_input_time(message_value, server_now: int) -> int:
+    try:
+        claimed = int(message_value)
+    except (TypeError, ValueError):
+        return server_now
+    return max(server_now - INPUT_TIME_CLAMP_MS, min(server_now + 40, claimed))
+
+
 @app.websocket("/ws")
 async def websocket_game(websocket: WebSocket):
     await websocket.accept()
@@ -437,9 +544,9 @@ async def websocket_game(websocket: WebSocket):
         "roomCode": room.code,
         "slot": player.slot,
         "serverNow": now_ms(),
+        "serverVersion": "3.0.0",
     })
     await broadcast_state(room)
-
 
     try:
         while True:
@@ -451,16 +558,42 @@ async def websocket_game(websocket: WebSocket):
             action = msg.get("action")
 
             if action == "lane":
+                if room.status != "running":
+                    continue
                 requested_lane = int(msg.get("lane", player.lane))
                 requested_lane = max(0, min(2, requested_lane))
                 current = time.monotonic()
-                if current - player.last_lane_change_at < 0.075:
+                if current - player.last_lane_change_at < 0.070:
                     continue
-                # Prevent teleporting from far left to far right in one network input.
                 if abs(requested_lane - player.lane) > 1:
                     requested_lane = player.lane + (1 if requested_lane > player.lane else -1)
                 player.lane = max(0, min(2, requested_lane))
                 player.last_lane_change_at = current
+
+            elif action in {"jump", "slide"}:
+                if room.status != "running":
+                    continue
+                server_now = now_ms()
+                event_ms = clamped_input_time(msg.get("eventTime"), server_now)
+                if event_ms - player.last_action_at_ms < ACTION_COOLDOWN_MS:
+                    continue
+                player.last_action_at_ms = event_ms
+                if action == "jump":
+                    player.jump_started_ms = event_ms
+                    player.jump_until_ms = event_ms + JUMP_DURATION_MS
+                    player.slide_started_ms = player.slide_until_ms = 0
+                else:
+                    player.slide_started_ms = event_ms
+                    player.slide_until_ms = event_ms + SLIDE_DURATION_MS
+                    player.jump_started_ms = player.jump_until_ms = 0
+                await broadcast(room, {
+                    "type": "pose",
+                    "playerId": player.id,
+                    "pose": action,
+                    "startedAt": event_ms,
+                    "until": player.jump_until_ms if action == "jump" else player.slide_until_ms,
+                    "serverNow": server_now,
+                })
 
             elif action == "ready":
                 if room.status == "waiting":
@@ -496,8 +629,9 @@ async def websocket_game(websocket: WebSocket):
                             p.hits = 0
                             p.lane = 1
                             p.ready = False
+                            p.jump_started_ms = p.jump_until_ms = 0
+                            p.slide_started_ms = p.slide_until_ms = 0
                         await broadcast_state(room)
-                await start_match(room)
 
     except WebSocketDisconnect:
         pass
