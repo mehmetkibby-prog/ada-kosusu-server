@@ -1,73 +1,73 @@
 import asyncio
 import json
 import random
+import string
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, List
 from urllib.parse import unquote
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Ada Kosusu Online Server", version="3.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title='Ada Serveti Online Server', version='1.0.0')
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
-MAX_HITS = 3
-ROOM_TTL_SECONDS = 60 * 60 * 2
-RECONNECT_GRACE_SECONDS = 15
-STATE_BROADCAST_INTERVAL = 0.18
-JUMP_DURATION_MS = 900
-SLIDE_DURATION_MS = 820
-ACTION_COOLDOWN_MS = 390
-INPUT_TIME_CLAMP_MS = 220
+START_MONEY = 1500
+PASS_START_BONUS = 200
+MAX_PLAYERS = 4
+ROOM_TTL = 7200
+
+BOARD = [
+    {'id':0,'name':'BAŞLANGIÇ','type':'start'},
+    {'id':1,'name':'Girne Limanı','type':'property','price':180,'rent':35},
+    {'id':2,'name':'ŞANS','type':'chance'},
+    {'id':3,'name':'Lefkoşa Çarşı','type':'property','price':200,'rent':40},
+    {'id':4,'name':'Ada Vergisi','type':'tax','amount':100},
+    {'id':5,'name':'Bellapais','type':'property','price':220,'rent':45},
+    {'id':6,'name':'ŞANS','type':'chance'},
+    {'id':7,'name':'Karpaz Sahili','type':'property','price':240,'rent':50},
+    {'id':8,'name':'Sahil Molası','type':'rest'},
+    {'id':9,'name':'Mağusa Surları','type':'property','price':260,'rent':55},
+    {'id':10,'name':'ŞANS','type':'chance'},
+    {'id':11,'name':'Salamis','type':'property','price':280,'rent':60},
+    {'id':12,'name':'Ada Festivali','type':'bonus','amount':100},
+    {'id':13,'name':'Güzelyurt Bahçeleri','type':'property','price':300,'rent':65},
+    {'id':14,'name':'Bakım Vergisi','type':'tax','amount':120},
+    {'id':15,'name':'ŞANS','type':'chance'},
+    {'id':16,'name':'Lefke Sahili','type':'property','price':320,'rent':70},
+    {'id':17,'name':'Fırtınalı Liman','type':'penalty'},
+    {'id':18,'name':'St. Hilarion','type':'property','price':340,'rent':75},
+    {'id':19,'name':'ŞANS','type':'chance'},
+    {'id':20,'name':'Akdeniz Koyu','type':'property','price':360,'rent':80},
+    {'id':21,'name':'Turizm Sezonu','type':'bonus','amount':120},
+    {'id':22,'name':'Koruçam','type':'property','price':380,'rent':90},
+    {'id':23,'name':'ŞANS','type':'chance'},
+]
+
+CHANCE_CARDS = [
+    ('Ada Festivali', 'Konser organizasyonundan 200 ₳ kazandın!', 'money', 200),
+    ('Ani Fırtına', 'Teknen hasar gördü. 150 ₳ öde.', 'money', -150),
+    ('Vergi İadesi', 'Belediyeden 100 ₳ iade aldın.', 'money', 100),
+    ('Turist Akını', 'Her rakip sana 75 ₳ öder.', 'collect', 75),
+    ('Hızlı Feribot', '3 kare ileri git!', 'move', 3),
+    ('Kira Sigortası', 'Bir sonraki kira ödemen ücretsiz.', 'shield', 1),
+    ('Liman Cezası', 'Bir sonraki turunu kaçırırsın.', 'skip', 1),
+    ('Şanslı Zar', 'Bu turdan sonra bir kez daha zar at!', 'extra', 1),
+    ('Tamirat Masrafı', 'Sahip olduğun her mülk için 50 ₳ öde.', 'repair', 50),
+    ('Ada Hibesi', 'Yerel kalkınma hibesi: 180 ₳ kazandın.', 'money', 180),
+]
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def now_ms(): return int(time.time()*1000)
 
-
-def normalize_room(code: str) -> str:
-    return "".join(ch for ch in code.upper() if ch.isalnum())[:8]
-
-
-def room_code(length: int = 5) -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+def make_code():
+    alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
     for _ in range(100):
-        candidate = "".join(random.choices(alphabet, k=length))
-        if candidate not in rooms:
-            return candidate
-    return uuid.uuid4().hex[:length].upper()
-
-
-@dataclass
-class Obstacle:
-    id: int
-    wave_id: int
-    lane: int
-    kind: str
-    avoid: str
-    spawn_at_ms: int
-    impact_at_ms: int
-    resolved_players: Set[str] = field(default_factory=set)
-
-    def payload(self) -> dict:
-        return {
-            "id": self.id,
-            "waveId": self.wave_id,
-            "lane": self.lane,
-            "kind": self.kind,
-            "avoid": self.avoid,
-            "spawnAt": self.spawn_at_ms,
-            "impactAt": self.impact_at_ms,
-        }
-
+        c=''.join(random.choices(alphabet,k=5))
+        if c not in rooms: return c
+    return uuid.uuid4().hex[:5].upper()
 
 @dataclass
 class Player:
@@ -75,590 +75,288 @@ class Player:
     token: str
     name: str
     slot: int
-    lane: int = 1
-    hits: int = 0
-    connected: bool = True
-    ready: bool = False
     ws: Optional[WebSocket] = None
-    disconnected_at: Optional[float] = None
-    last_lane_change_at: float = 0.0
-    last_action_at_ms: int = 0
-    jump_started_ms: int = 0
-    jump_until_ms: int = 0
-    slide_started_ms: int = 0
-    slide_until_ms: int = 0
-    joined_at: float = field(default_factory=time.time)
-
-    def pose_at(self, at_ms: int) -> str:
-        if self.jump_started_ms <= at_ms <= self.jump_until_ms:
-            return "jump"
-        if self.slide_started_ms <= at_ms <= self.slide_until_ms:
-            return "slide"
-        return "run"
-
-    def public(self, room: "Room") -> dict:
-        server_now = now_ms()
-        return {
-            "id": self.id,
-            "name": self.name,
-            "slot": self.slot,
-            "lane": self.lane,
-            "hits": self.hits,
-            "maxHits": MAX_HITS,
-            "connected": self.connected,
-            "ready": self.ready,
-            "isHost": self.slot == 1,
-            "distance": room.distance_m(),
-            "pose": self.pose_at(server_now),
-        }
-
+    ready: bool = False
+    connected: bool = True
+    money: int = START_MONEY
+    position: int = 0
+    skip_turns: int = 0
+    rent_shields: int = 0
+    extra_roll: bool = False
+    eliminated: bool = False
 
 @dataclass
 class Room:
     code: str
-    players: Dict[str, Player] = field(default_factory=dict)
-    status: str = "waiting"
+    players: Dict[str,Player] = field(default_factory=dict)
+    status: str = 'waiting'
+    host_id: Optional[str] = None
+    turn_order: List[str] = field(default_factory=list)
+    current_turn: int = 0
+    last_roll: Optional[int] = None
+    last_roller: Optional[str] = None
+    pending_purchase_player: Optional[str] = None
+    pending_purchase_tile: Optional[int] = None
+    owners: Dict[int,str] = field(default_factory=dict)
     winner_id: Optional[str] = None
-    finish_reason: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
-    start_at_ms: Optional[int] = None
-    seed: int = field(default_factory=lambda: random.randint(1, 2_000_000_000))
-    obstacle_index: int = 0
-    wave_index: int = 0
-    next_spawn_at_ms: Optional[int] = None
-    obstacles: List[Obstacle] = field(default_factory=list)
-    last_wave_style: str = ""
-    loop_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def active_players(self) -> List[Player]:
-        return [p for p in self.players.values() if p.connected and p.ws is not None]
+rooms: Dict[str,Room] = {}
+rooms_lock=asyncio.Lock()
 
-    def elapsed_s(self) -> float:
-        if not self.start_at_ms:
-            return 0.0
-        return max(0.0, (now_ms() - self.start_at_ms) / 1000.0)
-
-    def distance_m(self) -> int:
-        e = self.elapsed_s()
-        return int(e * 10.0 + min(180.0, e * e * 0.025))
-
-    def difficulty_stage(self) -> int:
-        e = self.elapsed_s()
-        if e < 18:
-            return 1
-        if e < 38:
-            return 2
-        if e < 62:
-            return 3
-        return 4
-
-    def speed_multiplier(self) -> float:
-        e = self.elapsed_s()
-        return min(1.85, 1.0 + e * 0.0105)
-
-    def payload(self) -> dict:
-        return {
-            "type": "state",
-            "serverNow": now_ms(),
-            "roomCode": self.code,
-            "status": self.status,
-            "startAt": self.start_at_ms,
-            "players": [p.public(self) for p in sorted(self.players.values(), key=lambda x: x.slot)],
-            "winnerId": self.winner_id,
-            "finishReason": self.finish_reason,
-            "maxHits": MAX_HITS,
-            "difficulty": self.difficulty_stage(),
-            "speedMultiplier": self.speed_multiplier(),
-        }
-
-
-rooms: Dict[str, Room] = {}
-rooms_lock = asyncio.Lock()
-
-
-@app.get("/")
+@app.get('/')
 async def root():
-    return {
-        "name": "Ada Kosusu Online Server V3",
-        "version": "3.0.0",
-        "ok": True,
-        "websocket": "/ws?mode=quick|create|join&name=...&room=...&token=...",
-    }
+    return {'name':'Ada Serveti Online Server','ok':True,'version':'1.0.0','websocket':'/ws'}
 
-
-@app.get("/health")
+@app.get('/health')
 async def health():
+    return {'ok':True,'rooms':len(rooms),'players':sum(len(r.players) for r in rooms.values()),'time':now_ms()}
+
+async def send(player:Player,payload:dict):
+    if not player.ws or not player.connected: return
+    try:
+        await player.ws.send_text(json.dumps(payload,ensure_ascii=False,separators=(',',':')))
+    except Exception:
+        player.connected=False; player.ws=None
+
+async def broadcast(room:Room,payload:dict):
+    await asyncio.gather(*(send(p,payload) for p in list(room.players.values())),return_exceptions=True)
+
+async def event(room:Room,title:str,text:str,kind:str='info'):
+    await broadcast(room,{'type':'event','title':title,'text':text,'kind':kind,'serverNow':now_ms()})
+
+
+def player_payload(room:Room,p:Player):
+    props=[tid for tid,owner in room.owners.items() if owner==p.id]
     return {
-        "ok": True,
-        "version": "3.0.0",
-        "rooms": len(rooms),
-        "players": sum(len(r.players) for r in rooms.values()),
-        "time": now_ms(),
+        'id':p.id,'name':p.name,'slot':p.slot,'ready':p.ready,'connected':p.connected,
+        'money':p.money,'position':p.position,'skipTurns':p.skip_turns,'rentShields':p.rent_shields,
+        'eliminated':p.eliminated,'properties':props,'isHost':p.id==room.host_id,
     }
 
 
-async def safe_send(player: Player, payload: dict) -> bool:
-    if not player.ws or not player.connected:
-        return False
-    try:
-        await player.ws.send_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        return True
-    except Exception:
-        player.connected = False
-        player.disconnected_at = time.time()
-        player.ws = None
-        return False
+def state_payload(room:Room):
+    current_id=None
+    if room.status=='playing' and room.turn_order:
+        current_id=room.turn_order[room.current_turn % len(room.turn_order)]
+    return {
+        'type':'state','roomCode':room.code,'status':room.status,'hostId':room.host_id,
+        'players':[player_payload(room,p) for p in sorted(room.players.values(),key=lambda x:x.slot)],
+        'currentPlayerId':current_id,'lastRoll':room.last_roll,'lastRollerId':room.last_roller,
+        'pendingPurchasePlayerId':room.pending_purchase_player,'pendingPurchaseTileId':room.pending_purchase_tile,
+        'owners':{str(k):v for k,v in room.owners.items()},'winnerId':room.winner_id,'board':BOARD,'serverNow':now_ms()
+    }
+
+async def broadcast_state(room:Room):
+    room.updated_at=time.time(); await broadcast(room,state_payload(room))
 
 
-async def broadcast(room: Room, payload: dict):
-    await asyncio.gather(*(safe_send(p, payload) for p in list(room.players.values())), return_exceptions=True)
+def alive_ids(room:Room):
+    return [pid for pid in room.turn_order if pid in room.players and not room.players[pid].eliminated]
 
-
-async def broadcast_state(room: Room):
-    room.updated_at = time.time()
-    await broadcast(room, room.payload())
-
-
-def difficulty_for(room: Room) -> tuple[int, int, int]:
-    """wave interval ms, obstacle travel ms, stage"""
-    stage = room.difficulty_stage()
-    e = room.elapsed_s()
-    if stage == 1:
-        interval = int(max(900, 1120 - e * 7))
-        travel = int(max(2450, 2820 - e * 15))
-    elif stage == 2:
-        interval = int(max(720, 880 - (e - 18) * 7))
-        travel = int(max(2050, 2400 - (e - 18) * 14))
-    elif stage == 3:
-        interval = int(max(580, 700 - (e - 38) * 5))
-        travel = int(max(1720, 2020 - (e - 38) * 12))
-    else:
-        interval = int(max(490, 570 - (e - 62) * 1.2))
-        travel = int(max(1480, 1700 - (e - 62) * 4.0))
-    return interval, travel, stage
-
-
-def rng_for(room: Room, salt: int) -> random.Random:
-    return random.Random(room.seed ^ (room.wave_index * 104729) ^ salt)
-
-
-def kind_for_avoid(avoid: str, rng: random.Random) -> str:
-    if avoid == "jump":
-        return rng.choice(["crate", "fallen_palm", "stone_hurdle"])
-    if avoid == "slide":
-        return rng.choice(["low_gate", "hanging_vines"])
-    return rng.choice(["barrel", "totem", "boulder"])
-
-
-def build_wave(room: Room, spawn_at: int, travel_ms: int, stage: int) -> tuple[List[Obstacle], int]:
-    rng = rng_for(room, 991)
-    roll = rng.random()
-    entries: List[tuple[int, str, str]] = []
-    style = "single"
-
-    # V3 difficulty: readable at first, then two-lane traps and compulsory jump/slide gates.
-    if stage == 1 or roll < (0.46 if stage == 2 else 0.28 if stage == 3 else 0.18):
-        lane = rng.randrange(3)
-        avoid = rng.choices(["jump", "slide", "dodge"], weights=[44, 23, 33])[0]
-        entries.append((lane, kind_for_avoid(avoid, rng), avoid))
-    elif roll < (0.90 if stage == 2 else 0.78 if stage == 3 else 0.68):
-        style = "double"
-        safe_lane = rng.randrange(3)
-        blocked = [lane for lane in range(3) if lane != safe_lane]
-        for lane in blocked:
-            avoid = rng.choices(["jump", "slide", "dodge"], weights=[38, 26, 36])[0]
-            entries.append((lane, kind_for_avoid(avoid, rng), avoid))
-    else:
-        # Full-width skill gate. It cannot be solved by lane switching; player must jump/slide.
-        style = "gate"
-        avoid = rng.choice(["jump", "slide"])
-        kind = "stone_hurdle" if avoid == "jump" else "low_gate"
-        for lane in range(3):
-            entries.append((lane, kind, avoid))
-
-    # Don't fire two compulsory gates almost back-to-back.
-    extra_gap = 0
-    if style == "gate":
-        extra_gap = 300 if stage <= 2 else 210
-        if room.last_wave_style == "gate":
-            extra_gap += 260
-    room.last_wave_style = style
-
-    obstacles: List[Obstacle] = []
-    wave_id = room.wave_index
-    for lane, kind, avoid in entries:
-        obstacles.append(Obstacle(
-            id=room.obstacle_index,
-            wave_id=wave_id,
-            lane=lane,
-            kind=kind,
-            avoid=avoid,
-            spawn_at_ms=spawn_at,
-            impact_at_ms=spawn_at + travel_ms,
-        ))
-        room.obstacle_index += 1
-    room.wave_index += 1
-    return obstacles, extra_gap
-
-
-async def start_match(room: Room):
-    async with room.lock:
-        if room.status in {"countdown", "running"}:
-            return
-        if len(room.active_players()) < 2:
-            return
-        room.status = "countdown"
-        room.winner_id = None
-        room.finish_reason = None
-        room.start_at_ms = now_ms() + 3200
-        room.seed = random.randint(1, 2_000_000_000)
-        room.obstacle_index = 0
-        room.wave_index = 0
-        room.last_wave_style = ""
-        room.next_spawn_at_ms = room.start_at_ms + 850
-        room.obstacles.clear()
-        for p in room.players.values():
-            p.lane = 1
-            p.hits = 0
-            p.ready = False
-            p.jump_started_ms = p.jump_until_ms = 0
-            p.slide_started_ms = p.slide_until_ms = 0
-            p.last_action_at_ms = 0
-        await broadcast(room, {
-            "type": "match_start",
-            "serverNow": now_ms(),
-            "startAt": room.start_at_ms,
-            "seed": room.seed,
-            "roomCode": room.code,
-        })
+async def check_bankruptcy(room:Room,p:Player):
+    if p.money>0 or p.eliminated: return
+    p.eliminated=True
+    for tid,owner in list(room.owners.items()):
+        if owner==p.id: del room.owners[tid]
+    await event(room,'İflas!',f'{p.name} parasını kaybetti ve oyundan elendi.','bad')
+    alive=alive_ids(room)
+    if len(alive)<=1:
+        room.status='finished'; room.winner_id=alive[0] if alive else None
+        if room.winner_id:
+            await event(room,'Oyun Bitti',f'{room.players[room.winner_id].name} Ada Serveti’nin kazananı!','win')
         await broadcast_state(room)
 
-    if room.loop_task is None or room.loop_task.done():
-        room.loop_task = asyncio.create_task(game_loop(room.code))
-
-
-async def finish_match(room: Room, winner_id: Optional[str], reason: str):
-    if room.status == "finished":
+async def advance_turn(room:Room):
+    if room.status!='playing': return
+    if room.pending_purchase_player: return
+    room.last_roll=None; room.last_roller=None
+    alive=alive_ids(room)
+    if len(alive)<=1:
+        await check_bankruptcy(room, room.players[alive[0]] if alive else next(iter(room.players.values())))
         return
-    room.status = "finished"
-    room.winner_id = winner_id
-    room.finish_reason = reason
-    await broadcast(room, {
-        "type": "game_over",
-        "winnerId": winner_id,
-        "reason": reason,
-        "serverNow": now_ms(),
-    })
+    # move at least once, skip eliminated players; consume skip-turns automatically
+    for _ in range(len(room.turn_order)*2):
+        room.current_turn=(room.current_turn+1)%len(room.turn_order)
+        pid=room.turn_order[room.current_turn]
+        p=room.players[pid]
+        if p.eliminated: continue
+        if p.skip_turns>0:
+            p.skip_turns-=1
+            await event(room,'Tur Kaçırıldı',f'{p.name} Fırtınalı Liman nedeniyle bu turu kaçırdı.','bad')
+            continue
+        break
     await broadcast_state(room)
 
+async def resolve_tile(room:Room,p:Player, depth:int=0):
+    if room.status!='playing' or p.eliminated: return
+    tile=BOARD[p.position]
+    t=tile['type']
+    if t=='property':
+        owner=room.owners.get(p.position)
+        if owner is None:
+            if p.money>=tile['price']:
+                room.pending_purchase_player=p.id; room.pending_purchase_tile=p.position
+                await event(room,'Satılık Mülk',f"{tile['name']} {tile['price']} ₳. {p.name} satın alabilir.",'property')
+                await broadcast_state(room); return
+            await event(room,'Yetersiz Para',f"{p.name}, {tile['name']} için yeterli paraya sahip değil.",'bad')
+        elif owner==p.id:
+            await event(room,'Kendi Mülkün',f"{p.name} kendi mülkü {tile['name']} üzerine geldi.",'info')
+        else:
+            landlord=room.players.get(owner)
+            rent=tile['rent']
+            if p.rent_shields>0:
+                p.rent_shields-=1
+                await event(room,'Kira Sigortası',f"{p.name}, {tile['name']} kirasını ödemedi.",'good')
+            elif landlord and not landlord.eliminated:
+                p.money-=rent; landlord.money+=rent
+                await event(room,'Kira!',f"{p.name}, {landlord.name} oyuncusuna {rent} ₳ kira ödedi.",'bad')
+                await check_bankruptcy(room,p)
+    elif t=='chance':
+        title,text,effect,value=random.choice(CHANCE_CARDS)
+        await event(room,'ŞANS — '+title,text,'chance')
+        if effect=='money': p.money+=value
+        elif effect=='collect':
+            for other in room.players.values():
+                if other.id!=p.id and not other.eliminated:
+                    take=min(value,max(0,other.money))
+                    other.money-=take; p.money+=take
+                    await check_bankruptcy(room,other)
+        elif effect=='move' and depth<2:
+            old=p.position; p.position=(p.position+value)%len(BOARD)
+            if p.position<old: p.money+=PASS_START_BONUS
+            await resolve_tile(room,p,depth+1)
+            if room.pending_purchase_player: return
+        elif effect=='shield': p.rent_shields+=1
+        elif effect=='skip': p.skip_turns+=1
+        elif effect=='extra': p.extra_roll=True
+        elif effect=='repair':
+            count=sum(1 for owner in room.owners.values() if owner==p.id); p.money-=count*value
+            await check_bankruptcy(room,p)
+    elif t=='tax':
+        p.money-=tile['amount']; await event(room,'Vergi',f"{p.name} {tile['amount']} ₳ ödedi.",'bad'); await check_bankruptcy(room,p)
+    elif t=='bonus':
+        p.money+=tile['amount']; await event(room,tile['name'],f"{p.name} {tile['amount']} ₳ kazandı!",'good')
+    elif t=='penalty':
+        p.skip_turns+=1; await event(room,'Fırtınalı Liman',f'{p.name} bir sonraki turunu kaçıracak.','bad')
+    elif t=='rest':
+        await event(room,'Sahil Molası',f'{p.name} biraz dinlendi. Para değişmedi.','info')
+    elif t=='start':
+        await event(room,'Başlangıç',f'{p.name} başlangıç karesinde.','good')
 
-def obstacle_hits_player(obstacle: Obstacle, player: Player) -> bool:
-    if player.lane != obstacle.lane:
-        return False
-    pose = player.pose_at(obstacle.impact_at_ms)
-    if obstacle.avoid == "jump" and pose == "jump":
-        return False
-    if obstacle.avoid == "slide" and pose == "slide":
-        return False
-    return True
+    if room.status!='playing' or room.pending_purchase_player: return
+    if p.extra_roll:
+        p.extra_roll=False
+        await event(room,'Ekstra Zar!',f'{p.name} bir kez daha zar atacak.','good')
+        await broadcast_state(room)
+    else:
+        await advance_turn(room)
 
+async def do_roll(room:Room,p:Player):
+    if room.status!='playing' or room.pending_purchase_player: return
+    current=room.turn_order[room.current_turn]
+    if current!=p.id or p.eliminated: return
+    roll=random.randint(1,6); old=p.position
+    p.position=(p.position+roll)%len(BOARD)
+    if p.position<old:
+        p.money+=PASS_START_BONUS
+        await event(room,'Başlangıç Bonusu',f'{p.name} başlangıcı geçti ve {PASS_START_BONUS} ₳ aldı.','good')
+    room.last_roll=roll; room.last_roller=p.id
+    await broadcast(room,{'type':'dice','playerId':p.id,'roll':roll,'position':p.position})
+    await asyncio.sleep(0.35)
+    await resolve_tile(room,p)
+    await broadcast_state(room)
 
-async def process_impacts(room: Room, current_ms: int):
-    for obstacle in list(room.obstacles):
-        if obstacle.impact_at_ms > current_ms:
-            continue
-        for player in list(room.players.values()):
-            if player.id in obstacle.resolved_players:
-                continue
-            obstacle.resolved_players.add(player.id)
-            if room.status != "running":
-                continue
-            if obstacle_hits_player(obstacle, player):
-                player.hits += 1
-                await broadcast(room, {
-                    "type": "hit",
-                    "playerId": player.id,
-                    "hits": player.hits,
-                    "maxHits": MAX_HITS,
-                    "obstacleId": obstacle.id,
-                    "avoid": obstacle.avoid,
-                    "serverNow": current_ms,
-                })
-                if player.hits >= MAX_HITS:
-                    opponents = [p for p in room.players.values() if p.id != player.id]
-                    winner_id = opponents[0].id if opponents else None
-                    await finish_match(room, winner_id, "three_hits")
-                    return
-
-        if current_ms - obstacle.impact_at_ms > 2500:
-            try:
-                room.obstacles.remove(obstacle)
-            except ValueError:
-                pass
-
-
-async def process_disconnects(room: Room):
-    if room.status != "running":
-        return
-    stamp = time.time()
-    for player in room.players.values():
-        if player.connected or player.disconnected_at is None:
-            continue
-        if stamp - player.disconnected_at >= RECONNECT_GRACE_SECONDS:
-            opponents = [p for p in room.players.values() if p.id != player.id and p.connected]
-            winner_id = opponents[0].id if opponents else None
-            await finish_match(room, winner_id, "opponent_disconnected")
-            return
-
-
-async def game_loop(code: str):
-    last_state = 0.0
-    while True:
-        room = rooms.get(code)
-        if not room:
-            return
-
-        async with room.lock:
-            current_ms = now_ms()
-            if room.status == "countdown" and room.start_at_ms and current_ms >= room.start_at_ms:
-                room.status = "running"
-                await broadcast(room, {"type": "go", "serverNow": current_ms})
-
-            if room.status == "running":
-                await process_disconnects(room)
-                if room.status == "running":
-                    interval_ms, travel_ms, stage = difficulty_for(room)
-                    while room.next_spawn_at_ms and current_ms >= room.next_spawn_at_ms:
-                        spawn_at = room.next_spawn_at_ms
-                        wave, extra_gap = build_wave(room, spawn_at, travel_ms, stage)
-                        room.obstacles.extend(wave)
-                        room.next_spawn_at_ms += interval_ms + extra_gap
-                        for obstacle in wave:
-                            await broadcast(room, {
-                                "type": "obstacle",
-                                "serverNow": current_ms,
-                                **obstacle.payload(),
-                            })
-                    await process_impacts(room, current_ms)
-
-            monotonic = time.monotonic()
-            if monotonic - last_state >= STATE_BROADCAST_INTERVAL:
-                await broadcast_state(room)
-                last_state = monotonic
-
-            if room.status == "finished":
-                return
-
-        await asyncio.sleep(0.035)
-
-
-async def find_or_create_room(mode: str, requested: str) -> Room:
+async def create_or_get_room(mode:str,requested:str):
     async with rooms_lock:
-        if mode == "create":
-            code = room_code()
-            room = Room(code=code)
-            rooms[code] = room
-            return room
-
-        if mode == "join":
-            code = normalize_room(requested)
-            if not code or code not in rooms:
-                raise ValueError("Oda bulunamadı.")
+        if mode=='create':
+            code=make_code(); r=Room(code=code); rooms[code]=r; return r
+        code=''.join(ch for ch in requested.upper() if ch.isalnum())[:8]
+        if mode=='join':
+            if code not in rooms: raise ValueError('Oda bulunamadı.')
             return rooms[code]
+        raise ValueError('Geçersiz mod.')
 
-        candidates = [
-            r for r in rooms.values()
-            if r.status == "waiting" and len(r.players) == 1 and len(r.active_players()) == 1
-        ]
-        if candidates:
-            return sorted(candidates, key=lambda r: r.created_at)[0]
-        code = room_code()
-        room = Room(code=code)
-        rooms[code] = room
-        return room
-
-
-async def add_or_reconnect_player(room: Room, websocket: WebSocket, name: str, token: str) -> Player:
+async def add_player(room:Room,ws:WebSocket,name:str,token:str):
     async with room.lock:
         if token:
             for p in room.players.values():
-                if p.token == token:
-                    p.ws = websocket
-                    p.connected = True
-                    p.disconnected_at = None
-                    p.name = name or p.name
-                    return p
+                if p.token==token:
+                    p.ws=ws;p.connected=True;p.name=name or p.name;return p
+        if room.status!='waiting': raise ValueError('Maç başlamış.')
+        if len(room.players)>=MAX_PLAYERS: raise ValueError('Oda dolu.')
+        slot=next(i for i in range(1,MAX_PLAYERS+1) if all(x.slot!=i for x in room.players.values()))
+        p=Player(id=uuid.uuid4().hex,token=uuid.uuid4().hex,name=(name or f'Oyuncu {slot}')[:16],slot=slot,ws=ws)
+        room.players[p.id]=p
+        if not room.host_id: room.host_id=p.id
+        return p
 
-        if len(room.players) >= 2:
-            raise ValueError("Bu oda dolu.")
-
-        used_slots = {p.slot for p in room.players.values()}
-        slot = 1 if 1 not in used_slots else 2
-        player = Player(
-            id=uuid.uuid4().hex,
-            token=uuid.uuid4().hex,
-            name=(name or f"Oyuncu {slot}")[:18],
-            slot=slot,
-            ws=websocket,
-        )
-        room.players[player.id] = player
-        return player
-
-
-def clamped_input_time(message_value, server_now: int) -> int:
+@app.websocket('/ws')
+async def websocket_endpoint(ws:WebSocket):
+    await ws.accept()
+    mode=(ws.query_params.get('mode') or 'create').lower()
+    code=ws.query_params.get('room') or ''
+    name=unquote(ws.query_params.get('name') or 'Oyuncu').strip()[:16]
+    token=ws.query_params.get('token') or ''
     try:
-        claimed = int(message_value)
-    except (TypeError, ValueError):
-        return server_now
-    return max(server_now - INPUT_TIME_CLAMP_MS, min(server_now + 40, claimed))
-
-
-@app.websocket("/ws")
-async def websocket_game(websocket: WebSocket):
-    await websocket.accept()
-
-    mode = (websocket.query_params.get("mode") or "quick").lower()
-    requested_room = websocket.query_params.get("room") or ""
-    name = unquote(websocket.query_params.get("name") or "Oyuncu").strip()[:18]
-    token = websocket.query_params.get("token") or ""
-
-    if mode not in {"quick", "create", "join"}:
-        await websocket.send_json({"type": "error", "message": "Geçersiz bağlantı modu."})
-        await websocket.close(code=1008)
-        return
-
-    try:
-        room = await find_or_create_room(mode, requested_room)
-        player = await add_or_reconnect_player(room, websocket, name, token)
-    except ValueError as exc:
-        await websocket.send_json({"type": "error", "message": str(exc)})
-        await websocket.close(code=1008)
-        return
-
-    await safe_send(player, {
-        "type": "welcome",
-        "playerId": player.id,
-        "playerToken": player.token,
-        "roomCode": room.code,
-        "slot": player.slot,
-        "serverNow": now_ms(),
-        "serverVersion": "3.0.0",
-    })
+        room=await create_or_get_room(mode,code); player=await add_player(room,ws,name,token)
+    except ValueError as e:
+        await ws.send_json({'type':'error','message':str(e)}); await ws.close(code=1008); return
+    await send(player,{'type':'welcome','playerId':player.id,'playerToken':player.token,'roomCode':room.code,'slot':player.slot})
     await broadcast_state(room)
-
     try:
         while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            action = msg.get("action")
-
-            if action == "lane":
-                if room.status != "running":
-                    continue
-                requested_lane = int(msg.get("lane", player.lane))
-                requested_lane = max(0, min(2, requested_lane))
-                current = time.monotonic()
-                if current - player.last_lane_change_at < 0.070:
-                    continue
-                if abs(requested_lane - player.lane) > 1:
-                    requested_lane = player.lane + (1 if requested_lane > player.lane else -1)
-                player.lane = max(0, min(2, requested_lane))
-                player.last_lane_change_at = current
-
-            elif action in {"jump", "slide"}:
-                if room.status != "running":
-                    continue
-                server_now = now_ms()
-                event_ms = clamped_input_time(msg.get("eventTime"), server_now)
-                if event_ms - player.last_action_at_ms < ACTION_COOLDOWN_MS:
-                    continue
-                player.last_action_at_ms = event_ms
-                if action == "jump":
-                    player.jump_started_ms = event_ms
-                    player.jump_until_ms = event_ms + JUMP_DURATION_MS
-                    player.slide_started_ms = player.slide_until_ms = 0
-                else:
-                    player.slide_started_ms = event_ms
-                    player.slide_until_ms = event_ms + SLIDE_DURATION_MS
-                    player.jump_started_ms = player.jump_until_ms = 0
-                await broadcast(room, {
-                    "type": "pose",
-                    "playerId": player.id,
-                    "pose": action,
-                    "startedAt": event_ms,
-                    "until": player.jump_until_ms if action == "jump" else player.slide_until_ms,
-                    "serverNow": server_now,
-                })
-
-            elif action == "ready":
-                if room.status == "waiting":
-                    player.ready = bool(msg.get("ready", not player.ready))
-                    await broadcast_state(room)
-
-            elif action == "start":
-                if room.status == "waiting":
-                    if player.slot != 1:
-                        await safe_send(player, {"type": "error", "message": "Oyunu yalnızca oda sahibi başlatabilir."})
-                    elif len(room.active_players()) < 2:
-                        await safe_send(player, {"type": "error", "message": "Başlamak için iki oyuncu gerekli."})
-                    elif not all(p.ready for p in room.active_players()):
-                        await safe_send(player, {"type": "error", "message": "İki oyuncunun da Hazırım demesi gerekiyor."})
+            raw=await ws.receive_text()
+            try: msg=json.loads(raw)
+            except json.JSONDecodeError: continue
+            action=msg.get('action')
+            async with room.lock:
+                if action=='ready' and room.status=='waiting':
+                    player.ready=bool(msg.get('ready',not player.ready)); await broadcast_state(room)
+                elif action=='start' and player.id==room.host_id and room.status=='waiting':
+                    active=[p for p in room.players.values() if p.connected]
+                    if len(active)<2:
+                        await send(player,{'type':'error','message':'En az 2 oyuncu gerekli.'}); continue
+                    if not all(p.ready for p in active):
+                        await send(player,{'type':'error','message':'Herkes hazır olmalı.'}); continue
+                    room.status='playing'; room.turn_order=[p.id for p in sorted(active,key=lambda x:x.slot)]
+                    room.current_turn=0; room.last_roll=None; room.winner_id=None
+                    for p in active:
+                        p.money=START_MONEY;p.position=0;p.skip_turns=0;p.rent_shields=0;p.extra_roll=False;p.eliminated=False;p.ready=False
+                    room.owners.clear(); room.pending_purchase_player=None;room.pending_purchase_tile=None
+                    await event(room,'Oyun Başladı',f'İlk sıra {room.players[room.turn_order[0]].name} oyuncusunda!','good'); await broadcast_state(room)
+                elif action=='roll':
+                    asyncio.create_task(do_roll(room,player))
+                elif action in {'buy','pass'} and room.pending_purchase_player==player.id:
+                    tid=room.pending_purchase_tile
+                    if tid is None: continue
+                    tile=BOARD[tid]
+                    if action=='buy' and room.owners.get(tid) is None and player.money>=tile.get('price',10**9):
+                        player.money-=tile['price']; room.owners[tid]=player.id
+                        await event(room,'Mülk Satın Alındı',f"{player.name}, {tile['name']} mülkünü {tile['price']} ₳ karşılığında aldı.",'property')
                     else:
-                        await start_match(room)
-
-            elif action == "ping":
-                await safe_send(player, {
-                    "type": "pong",
-                    "clientTs": msg.get("ts"),
-                    "serverNow": now_ms(),
-                })
-
-            elif action == "rematch":
-                async with room.lock:
-                    if room.status == "finished" and len(room.active_players()) >= 2:
-                        room.status = "waiting"
-                        room.winner_id = None
-                        room.finish_reason = None
-                        room.start_at_ms = None
-                        for p in room.players.values():
-                            p.hits = 0
-                            p.lane = 1
-                            p.ready = False
-                            p.jump_started_ms = p.jump_until_ms = 0
-                            p.slide_started_ms = p.slide_until_ms = 0
-                        await broadcast_state(room)
-
+                        await event(room,'Satın Alınmadı',f"{player.name}, {tile['name']} mülkünü pas geçti.",'info')
+                    room.pending_purchase_player=None;room.pending_purchase_tile=None
+                    await advance_turn(room)
+                elif action=='ping':
+                    await send(player,{'type':'pong','clientTime':msg.get('clientTime'),'serverNow':now_ms()})
     except WebSocketDisconnect:
-        pass
+        player.connected=False;player.ws=None
+        await broadcast_state(room)
     except Exception:
-        pass
-    finally:
-        async with room.lock:
-            if player.ws is websocket:
-                player.connected = False
-                player.disconnected_at = time.time()
-                player.ws = None
-                await broadcast_state(room)
-
+        player.connected=False;player.ws=None
+        await broadcast_state(room)
 
 async def cleanup_loop():
     while True:
-        await asyncio.sleep(60)
-        cutoff = time.time() - ROOM_TTL_SECONDS
+        await asyncio.sleep(300)
+        cutoff=time.time()-ROOM_TTL
         async with rooms_lock:
-            stale = [code for code, room in rooms.items() if room.updated_at < cutoff]
-            for code in stale:
-                task = rooms[code].loop_task
-                if task and not task.done():
-                    task.cancel()
-                rooms.pop(code, None)
+            for code,r in list(rooms.items()):
+                if r.updated_at<cutoff: rooms.pop(code,None)
 
-
-@app.on_event("startup")
+@app.on_event('startup')
 async def startup():
     asyncio.create_task(cleanup_loop())
