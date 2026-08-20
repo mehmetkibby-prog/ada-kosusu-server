@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: ada-kosusu-online
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
